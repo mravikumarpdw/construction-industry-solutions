@@ -1,0 +1,1002 @@
+// Construction Industry Solutions — data model
+// Anchored on SRS §8 (Key Entities). SQLite for zero-setup dev; portable to
+// PostgreSQL (change datasource provider + regenerate). Enums are modelled as
+// String fields (SQLite has no native enums) with allowed values documented
+// inline. Money is stored as Float and rounded to 2dp by the money() helper
+// (see src/lib/money.ts) per validation rule V-06.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PLATFORM · Tenant, Users, RBAC, Audit, Activity, Alerts, Media, Counters
+// ─────────────────────────────────────────────────────────────────────────
+
+model Tenant {
+  id            String   @id @default(cuid())
+  name          String
+  code          String   @unique
+  logoUrl       String?
+  financialYear String   @default("2026-27") // statutory FY
+  gstin         String?
+  settings      String? // JSON text: approval matrices, statutory config, feature flags
+  createdAt     DateTime @default(now())
+
+  users     User[]
+  projects  Project[]
+  roles     Role[]
+  costHeads CostHead[]
+  vendors   Vendor[]
+  contractors Contractor[]
+  items     Item[]
+  workers   Worker[]
+  clients   Client[]
+  equipment Equipment[]
+}
+
+model Role {
+  id          String  @id @default(cuid())
+  tenantId    String
+  name        String // Managing Director, Project Manager, Site Engineer, ...
+  key         String // md | pm | planner | site | store | purchase | billing | hr | accounts | qhse | contractor | admin
+  description String?
+  permissions String  @default("{}") // JSON text: { "module.screen.action": true } matrix (see lib/rbac)
+  isSystem    Boolean @default(false)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  users  User[]
+
+  @@unique([tenantId, key])
+}
+
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String
+  roleId       String
+  name         String
+  email        String   @unique
+  phone        String?
+  passwordHash String
+  avatarUrl    String?
+  designation  String?
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+
+  tenant      Tenant             @relation(fields: [tenantId], references: [id])
+  role        Role               @relation(fields: [roleId], references: [id])
+  assignments ProjectAssignment[]
+}
+
+// Per-project scoping (SRS §4: access scoped by project assignment)
+model ProjectAssignment {
+  id        String @id @default(cuid())
+  userId    String
+  projectId String
+
+  user    User    @relation(fields: [userId], references: [id])
+  project Project @relation(fields: [projectId], references: [id])
+
+  @@unique([userId, projectId])
+}
+
+// Immutable audit trail (SRS ERP-025, V-09) + generic activity feed that also
+// surfaces MOBILE-originated actions in the web app.
+model AuditLog {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String?
+  actorId    String?
+  actorName  String?
+  action     String // create | update | approve | delete | login | post
+  entityType String
+  entityId   String?
+  before     String? // JSON text
+  after      String? // JSON text
+  source     String   @default("WEB") // WEB | MOBILE | SYSTEM
+  createdAt  DateTime @default(now())
+
+  @@index([tenantId, entityType])
+  @@index([projectId])
+}
+
+// Human-readable activity stream (dashboards, "Mobile Activity" view)
+model ActivityEvent {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String?
+  actorId    String?
+  actorName  String?
+  type       String // attendance | indent | grn | issue | progress | mb | rabill | po | payment | ncr | ...
+  title      String
+  detail     String?
+  source     String   @default("WEB") // WEB | MOBILE | SYSTEM  ← mobile tracking
+  deviceId   String?
+  lat        Float?
+  lng        Float?
+  meta       String? // JSON text
+  createdAt  DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([projectId, createdAt])
+  @@index([source])
+}
+
+// Exception alert engine (RPT-003)
+model Alert {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String?
+  type       String // budget_breach | milestone_slip | low_stock | doc_expiry | approval_sla | attendance_anomaly
+  severity   String   @default("medium") // low | medium | high | critical
+  title      String
+  message    String
+  entityType String?
+  entityId   String?
+  isRead     Boolean  @default(false)
+  isResolved Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([tenantId, isResolved])
+}
+
+// Generic media (photos/documents) bound to any transaction (V-11)
+model Attachment {
+  id         String   @id @default(cuid())
+  tenantId   String
+  entityType String
+  entityId   String
+  url        String
+  kind       String   @default("photo") // photo | document | challan | weighbridge | selfie
+  lat        Float?
+  lng        Float?
+  takenAt    DateTime?
+  uploadedBy String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
+
+// Gap-free document number series per tenant/site/FY (V-10)
+model Counter {
+  id       String @id @default(cuid())
+  tenantId String
+  scope    String // e.g. "PO:2026-27", "GRN:SITE1:2026-27"
+  value    Int    @default(0)
+
+  @@unique([tenantId, scope])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// MASTERS · Clients, Projects, Cost heads, BOQ, WBS/Tasks
+// ─────────────────────────────────────────────────────────────────────────
+
+model Client {
+  id       String  @id @default(cuid())
+  tenantId String
+  name     String
+  gstin    String?
+  contact  String?
+  email    String?
+  phone    String?
+  address  String?
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id])
+  projects Project[]
+}
+
+model Project {
+  id            String   @id @default(cuid())
+  tenantId      String
+  code          String
+  name          String
+  clientId      String?
+  type          String   @default("residential") // residential | commercial | infra | industrial
+  status        String   @default("Active") // Planned | Active | On Hold | Closed
+  // geofence for attendance
+  lat           Float?
+  lng           Float?
+  geofenceRadius Int     @default(200) // metres
+  location      String?
+  contractValue Float    @default(0)
+  startDate     DateTime?
+  endDate       DateTime?
+  createdAt     DateTime @default(now())
+
+  tenant      Tenant              @relation(fields: [tenantId], references: [id])
+  client      Client?             @relation(fields: [clientId], references: [id])
+  assignments ProjectAssignment[]
+  boqItems    BoqItem[]
+  tasks       Task[]
+  budgetLines BudgetLine[]
+  ledger      CostLedgerEntry[]
+  indents     Indent[]
+  purchaseOrders PurchaseOrder[]
+  grns        Grn[]
+  issues      MaterialIssue[]
+  stockItems  StockItem[]
+  workOrders  WorkOrder[]
+  raBills     RaBill[]
+  punches     AttendancePunch[]
+  wageSheets  WageSheet[]
+  equipmentLogs EquipmentLog[]
+  ncrs        Ncr[]
+  incidents   SafetyIncident[]
+  inspections Inspection[]
+  documents   Document[]
+  clientBills ClientRaBill[]
+  milestones  Milestone[]
+
+  @@unique([tenantId, code])
+}
+
+model CostHead {
+  id       String @id @default(cuid())
+  tenantId String
+  code     String // MAT | LAB | SUB | EQP | OH
+  name     String // Material | Labour | Subcontract | Equipment | Overheads
+  sort     Int    @default(0)
+
+  tenant   Tenant            @relation(fields: [tenantId], references: [id])
+  boqItems BoqItem[]
+  ledger   CostLedgerEntry[]
+  budgets  BudgetLine[]
+
+  @@unique([tenantId, code])
+}
+
+// Bill of Quantities item — the cost/progress anchor (SRS §8)
+model BoqItem {
+  id          String  @id @default(cuid())
+  projectId   String
+  costHeadId  String?
+  code        String
+  description String
+  unit        String  @default("nos")
+  quantity    Float   @default(0)
+  rate        Float   @default(0)
+  amount      Float   @default(0) // quantity * rate
+  norm        Float? // coefficient: material per BOQ unit (TEN-004 / MAT-001)
+  sort        Int     @default(0)
+
+  project  Project           @relation(fields: [projectId], references: [id])
+  costHead CostHead?         @relation(fields: [costHeadId], references: [id])
+  tasks    Task[]
+  budgets  BudgetLine[]
+  ledger   CostLedgerEntry[]
+  indentLines IndentLine[]
+  woLines  WorkOrderLine[]
+  issues   MaterialIssue[]
+
+  @@index([projectId])
+}
+
+// WBS / Task tree (PM-001/002)
+model Task {
+  id           String    @id @default(cuid())
+  projectId    String
+  boqItemId    String?
+  parentId     String?
+  name         String
+  wbsCode      String?
+  plannedStart DateTime?
+  plannedEnd   DateTime?
+  actualStart  DateTime?
+  actualEnd    DateTime?
+  baselineStart DateTime?
+  baselineEnd   DateTime?
+  plannedQty   Float     @default(0)
+  actualQty    Float     @default(0)
+  unit         String    @default("nos")
+  progress     Float     @default(0) // 0-100 physical %
+  weight       Float     @default(0) // BOQ-value weight for rollup
+  dependency   String? // predecessor task id(s), FS/SS/FF/SF encoded
+  assigneeId   String?
+  status       String    @default("Not Started") // Not Started | In Progress | Completed | Delayed
+  sort         Int       @default(0)
+
+  project  Project @relation(fields: [projectId], references: [id])
+  boqItem  BoqItem? @relation(fields: [boqItemId], references: [id])
+  parent   Task?   @relation("TaskTree", fields: [parentId], references: [id])
+  children Task[]  @relation("TaskTree")
+  progressUpdates ProgressUpdate[]
+
+  @@index([projectId])
+}
+
+model Milestone {
+  id         String   @id @default(cuid())
+  projectId  String
+  name       String
+  targetDate DateTime
+  actualDate DateTime?
+  status     String   @default("Pending") // Pending | Achieved | Slipped
+  billingStage Boolean @default(false)
+
+  project Project @relation(fields: [projectId], references: [id])
+}
+
+// Daily progress updates from site (PM-010) → DPR
+model ProgressUpdate {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String
+  taskId     String
+  date       DateTime @default(now())
+  qtyToday   Float    @default(0)
+  manpower   Int      @default(0)
+  machinery  String?
+  weather    String?
+  hindrance  String?
+  remarks    String?
+  source     String   @default("WEB")
+  createdBy  String?
+
+  task Task @relation(fields: [taskId], references: [id])
+
+  @@index([projectId, date])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// COST LEDGER — the heart. Every module posts Budget/Committed/Actual here.
+// Immutable once posted; reversals via contra entries (SRS §7.7, §8, V-01).
+// ─────────────────────────────────────────────────────────────────────────
+
+model BudgetLine {
+  id         String   @id @default(cuid())
+  projectId  String
+  boqItemId  String?
+  costHeadId String?
+  amount     Float    @default(0)
+  version    Int      @default(1)
+  approved   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  project  Project   @relation(fields: [projectId], references: [id])
+  boqItem  BoqItem?  @relation(fields: [boqItemId], references: [id])
+  costHead CostHead? @relation(fields: [costHeadId], references: [id])
+
+  @@index([projectId])
+}
+
+model CostLedgerEntry {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String
+  boqItemId  String?
+  costHeadId String?
+  type       String // Budget | Committed | Actual
+  amount     Float    @default(0) // signed; contra reversals are negative
+  sourceType String // PO | WO | GRN | Issue | WageSheet | RABill | Expense | EquipmentLog | Budget
+  sourceId   String?
+  description String?
+  createdAt  DateTime @default(now())
+
+  project  Project   @relation(fields: [projectId], references: [id])
+  boqItem  BoqItem?  @relation(fields: [boqItemId], references: [id])
+  costHead CostHead? @relation(fields: [costHeadId], references: [id])
+
+  @@index([projectId, type])
+  @@index([boqItemId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PROCUREMENT · Vendors, Indents, RFQ, PO, GRN, Invoices, Payments, Stock
+// ─────────────────────────────────────────────────────────────────────────
+
+model Vendor {
+  id        String  @id @default(cuid())
+  tenantId  String
+  name      String
+  gstin     String?
+  pan       String?
+  bank      String?
+  category  String?
+  rating    Float   @default(0)
+  docExpiry DateTime?
+  isActive  Boolean @default(true)
+
+  tenant         Tenant          @relation(fields: [tenantId], references: [id])
+  purchaseOrders PurchaseOrder[]
+  invoices       VendorInvoice[]
+
+  @@index([tenantId])
+}
+
+model Item {
+  id          String  @id @default(cuid())
+  tenantId    String
+  code        String
+  name        String
+  category    String?
+  unit        String  @default("nos")
+  hsn         String?
+  minStock    Float   @default(0)
+  maxStock    Float   @default(0)
+  isActive    Boolean @default(true)
+
+  tenant      Tenant       @relation(fields: [tenantId], references: [id])
+  indentLines IndentLine[]
+  poLines     PurchaseOrderLine[]
+  grnLines    GrnLine[]
+  stockItems  StockItem[]
+  issues      MaterialIssue[]
+
+  @@unique([tenantId, code])
+}
+
+model Indent {
+  id          String   @id @default(cuid())
+  tenantId    String
+  projectId   String
+  number      String
+  requiredBy  DateTime?
+  status      String   @default("Raised") // Raised | Approved | Rejected | Ordered | Partially Received | Closed
+  remarks     String?
+  raisedById  String?
+  raisedByName String?
+  source      String   @default("WEB")
+  createdAt   DateTime @default(now())
+
+  project Project      @relation(fields: [projectId], references: [id])
+  lines   IndentLine[]
+
+  @@index([projectId, status])
+}
+
+model IndentLine {
+  id        String @id @default(cuid())
+  indentId  String
+  itemId    String
+  boqItemId String?
+  quantity  Float  @default(0)
+  unit      String @default("nos")
+  remarks   String?
+
+  indent  Indent   @relation(fields: [indentId], references: [id], onDelete: Cascade)
+  item    Item     @relation(fields: [itemId], references: [id])
+  boqItem BoqItem? @relation(fields: [boqItemId], references: [id])
+}
+
+model PurchaseOrder {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String
+  vendorId   String
+  number     String
+  status     String   @default("Approved") // Draft | Approved | Partially Received | Received | Closed | Cancelled
+  subTotal   Float    @default(0)
+  taxAmount  Float    @default(0)
+  total      Float    @default(0)
+  deliveryTo String?
+  terms      String?
+  createdAt  DateTime @default(now())
+
+  project Project             @relation(fields: [projectId], references: [id])
+  vendor  Vendor              @relation(fields: [vendorId], references: [id])
+  lines   PurchaseOrderLine[]
+  grns    Grn[]
+
+  @@index([projectId, status])
+}
+
+model PurchaseOrderLine {
+  id           String @id @default(cuid())
+  poId         String
+  itemId       String
+  boqItemId    String?
+  quantity     Float  @default(0)
+  receivedQty  Float  @default(0)
+  rate         Float  @default(0)
+  gstPct       Float  @default(18)
+  amount       Float  @default(0)
+
+  po   PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
+  item Item          @relation(fields: [itemId], references: [id])
+  grnLines GrnLine[]
+}
+
+model Grn {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String
+  poId       String
+  number     String
+  vehicleNo  String?
+  weighbridge String?
+  challanNo  String?
+  status     String   @default("Received") // Received | Quality Hold | Accepted
+  receivedById String?
+  source     String   @default("WEB")
+  createdAt  DateTime @default(now())
+
+  project Project   @relation(fields: [projectId], references: [id])
+  po      PurchaseOrder @relation(fields: [poId], references: [id])
+  lines   GrnLine[]
+
+  @@index([projectId])
+}
+
+model GrnLine {
+  id          String @id @default(cuid())
+  grnId       String
+  poLineId    String
+  itemId      String
+  receivedQty Float  @default(0)
+  acceptedQty Float  @default(0)
+  rejectedQty Float  @default(0)
+  rate        Float  @default(0)
+
+  grn    Grn               @relation(fields: [grnId], references: [id], onDelete: Cascade)
+  poLine PurchaseOrderLine @relation(fields: [poLineId], references: [id])
+  item   Item              @relation(fields: [itemId], references: [id])
+}
+
+model VendorInvoice {
+  id        String   @id @default(cuid())
+  tenantId  String
+  vendorId  String
+  poId      String?
+  number    String
+  baseAmount Float   @default(0)
+  gstAmount Float    @default(0)
+  tdsPct    Float    @default(0)
+  tdsAmount Float    @default(0)
+  netPayable Float   @default(0)
+  status    String   @default("Booked") // Booked | Approved | Paid
+  createdAt DateTime @default(now())
+
+  vendor   Vendor    @relation(fields: [vendorId], references: [id])
+  payments Payment[]
+}
+
+model Payment {
+  id          String   @id @default(cuid())
+  tenantId    String
+  partyType   String // vendor | contractor | worker
+  partyId     String
+  partyName   String?
+  invoiceId   String?
+  raBillId    String?
+  amount      Float    @default(0)
+  mode        String   @default("bank") // bank | upi | cheque
+  reference   String?
+  kind        String   @default("payment") // payment | advance | retention_release
+  createdAt   DateTime @default(now())
+
+  invoice VendorInvoice? @relation(fields: [invoiceId], references: [id])
+  raBill  RaBill?        @relation(fields: [raBillId], references: [id])
+}
+
+// Current stock position per site (project) + item, with weighted-avg rate
+model StockItem {
+  id        String @id @default(cuid())
+  tenantId  String
+  projectId String
+  itemId    String
+  quantity  Float  @default(0)
+  wavgRate  Float  @default(0)
+  value     Float  @default(0)
+
+  project Project @relation(fields: [projectId], references: [id])
+  item    Item    @relation(fields: [itemId], references: [id])
+
+  @@unique([projectId, itemId])
+}
+
+// Every stock movement (V-04: never negative, atomic wavg recompute)
+model StockLedgerEntry {
+  id        String   @id @default(cuid())
+  tenantId  String
+  projectId String
+  itemId    String
+  direction String // in | out
+  quantity  Float    @default(0)
+  rate      Float    @default(0)
+  balanceQty Float   @default(0)
+  wavgRate  Float    @default(0)
+  sourceType String // GRN | Issue | Transfer | Adjustment | Return
+  sourceId  String?
+  createdAt DateTime @default(now())
+
+  @@index([projectId, itemId])
+}
+
+model MaterialIssue {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String
+  itemId     String
+  boqItemId  String?
+  taskId     String?
+  contractorId String? // free-issue to contractor (MAT-013)
+  quantity   Float    @default(0)
+  rate       Float    @default(0)
+  value      Float    @default(0)
+  issuedToType String @default("work") // work | contractor
+  source     String   @default("WEB")
+  createdAt  DateTime @default(now())
+
+  project    Project     @relation(fields: [projectId], references: [id])
+  item       Item        @relation(fields: [itemId], references: [id])
+  boqItem    BoqItem?    @relation(fields: [boqItemId], references: [id])
+  contractor Contractor? @relation(fields: [contractorId], references: [id])
+
+  @@index([projectId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ATTENDANCE · Workers, Punches, Wage sheets
+// ─────────────────────────────────────────────────────────────────────────
+
+model Worker {
+  id          String  @id @default(cuid())
+  tenantId    String
+  contractorId String?
+  code        String
+  name        String
+  photoUrl    String?
+  trade       String? // Mason | Carpenter | Helper | Bar Bender | Electrician ...
+  category    String  @default("own") // own | contractor | nmr
+  wageType    String  @default("daily") // daily | hourly | piece
+  rate        Float   @default(0)
+  aadhaarRef  String?
+  bank        String?
+  pfApplicable Boolean @default(false)
+  esiApplicable Boolean @default(false)
+  isActive    Boolean @default(true)
+
+  tenant     Tenant           @relation(fields: [tenantId], references: [id])
+  contractor Contractor?      @relation(fields: [contractorId], references: [id])
+  punches    AttendancePunch[]
+  wageLines  WageLine[]
+
+  @@unique([tenantId, code])
+}
+
+model AttendancePunch {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String
+  workerId   String
+  date       DateTime
+  status     String   @default("P") // P | A | Half | OT
+  hours      Float    @default(8)
+  otHours    Float    @default(0)
+  checkInAt  DateTime?
+  checkOutAt DateTime?
+  lat        Float?
+  lng        Float?
+  selfieUrl  String?
+  deviceId   String?
+  withinGeofence Boolean @default(true)
+  source     String   @default("MOBILE") // most attendance comes from site mobile
+  flagged    Boolean  @default(false) // anti-fraud (ATT-016)
+  flagReason String?
+  createdAt  DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id])
+  worker  Worker  @relation(fields: [workerId], references: [id])
+
+  @@unique([workerId, date])
+  @@index([projectId, date])
+}
+
+model WageSheet {
+  id          String   @id @default(cuid())
+  tenantId    String
+  projectId   String
+  periodStart DateTime
+  periodEnd   DateTime
+  status      String   @default("Draft") // Draft | Approved | Paid | Locked
+  gross       Float    @default(0)
+  deductions  Float    @default(0)
+  net         Float    @default(0)
+  createdAt   DateTime @default(now())
+
+  project Project    @relation(fields: [projectId], references: [id])
+  lines   WageLine[]
+
+  @@index([projectId])
+}
+
+model WageLine {
+  id          String @id @default(cuid())
+  wageSheetId String
+  workerId    String
+  daysWorked  Float  @default(0)
+  otHours     Float  @default(0)
+  rate        Float  @default(0)
+  gross       Float  @default(0)
+  advance     Float  @default(0)
+  deductions  Float  @default(0)
+  net         Float  @default(0)
+
+  wageSheet WageSheet @relation(fields: [wageSheetId], references: [id], onDelete: Cascade)
+  worker    Worker    @relation(fields: [workerId], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CONTRACTOR · Work orders, Measurement books, RA bills
+// ─────────────────────────────────────────────────────────────────────────
+
+model Contractor {
+  id        String  @id @default(cuid())
+  tenantId  String
+  name      String
+  trade     String?
+  gstin     String?
+  pan       String?
+  bank      String?
+  rating    Float   @default(0)
+  docExpiry DateTime?
+  isActive  Boolean @default(true)
+
+  tenant     Tenant          @relation(fields: [tenantId], references: [id])
+  workers    Worker[]
+  workOrders WorkOrder[]
+  issues     MaterialIssue[]
+
+  @@index([tenantId])
+}
+
+model WorkOrder {
+  id          String   @id @default(cuid())
+  tenantId    String
+  projectId   String
+  contractorId String
+  number      String
+  type        String   @default("item-rate") // item-rate | labour-rate | lumpsum | composite
+  status      String   @default("Active") // Draft | Active | Closed | Cancelled
+  retentionPct Float   @default(5)
+  advancePct  Float    @default(10)
+  advancePaid Float    @default(0)
+  advanceRecovered Float @default(0)
+  retentionHeld Float   @default(0)
+  value       Float    @default(0)
+  deviationPct Float   @default(5)
+  createdAt   DateTime @default(now())
+
+  project    Project         @relation(fields: [projectId], references: [id])
+  contractor Contractor      @relation(fields: [contractorId], references: [id])
+  lines      WorkOrderLine[]
+  raBills    RaBill[]
+
+  @@index([projectId, status])
+}
+
+model WorkOrderLine {
+  id         String @id @default(cuid())
+  woId       String
+  boqItemId  String?
+  description String
+  unit       String @default("nos")
+  quantity   Float  @default(0)
+  rate       Float  @default(0)
+  amount     Float  @default(0)
+  measuredQty Float @default(0) // cumulative from MB
+
+  wo      WorkOrder @relation(fields: [woId], references: [id], onDelete: Cascade)
+  boqItem BoqItem?  @relation(fields: [boqItemId], references: [id])
+  mbEntries MbEntry[]
+}
+
+// Digital Measurement Book (CON-010)
+model MbEntry {
+  id         String   @id @default(cuid())
+  tenantId   String
+  woLineId   String
+  date       DateTime @default(now())
+  location   String?
+  nos        Float    @default(1)
+  length     Float    @default(0)
+  breadth    Float    @default(0)
+  height     Float    @default(0)
+  quantity   Float    @default(0) // computed nos*l*b*h or direct
+  status     String   @default("Approved") // Draft | Approved
+  billedInId String? // RA bill that consumed it (bill-once, V-05)
+  source     String   @default("WEB")
+  createdBy  String?
+  createdAt  DateTime @default(now())
+
+  woLine WorkOrderLine @relation(fields: [woLineId], references: [id], onDelete: Cascade)
+
+  @@index([woLineId])
+}
+
+model RaBill {
+  id              String   @id @default(cuid())
+  tenantId        String
+  projectId       String
+  woId            String
+  number          String
+  seq             Int      @default(1) // RA-1, RA-2 ...
+  grossThisBill   Float    @default(0)
+  cumulativeValue Float    @default(0)
+  previousValue   Float    @default(0)
+  retention       Float    @default(0)
+  advanceRecovery Float    @default(0)
+  materialRecovery Float   @default(0)
+  otherRecovery   Float    @default(0)
+  gstAmount       Float    @default(0)
+  tdsAmount       Float    @default(0)
+  netPayable      Float    @default(0)
+  status          String   @default("Draft") // Draft | Submitted | Approved | Paid
+  createdAt       DateTime @default(now())
+
+  project  Project   @relation(fields: [projectId], references: [id])
+  wo       WorkOrder @relation(fields: [woId], references: [id])
+  payments Payment[]
+
+  @@index([projectId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// TENDERING · Opportunities & estimates
+// ─────────────────────────────────────────────────────────────────────────
+
+model Tender {
+  id             String   @id @default(cuid())
+  tenantId       String
+  name           String
+  clientName     String?
+  estimatedValue Float    @default(0)
+  emd            Float    @default(0)
+  submissionDate DateTime?
+  status         String   @default("Bidding") // Identified | Bidding | Won | Lost
+  probability    Int      @default(50)
+  remarks        String?
+  convertedProjectId String?
+  createdAt      DateTime @default(now())
+
+  @@index([tenantId, status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// EQUIPMENT · Assets & daily logs
+// ─────────────────────────────────────────────────────────────────────────
+
+model Equipment {
+  id         String  @id @default(cuid())
+  tenantId   String
+  code       String
+  name       String
+  category   String?
+  ownership  String  @default("owned") // owned | hired
+  hireRate   Float   @default(0) // per hour/day
+  status     String  @default("Available") // Available | Deployed | Maintenance | Breakdown
+  docExpiry  DateTime?
+
+  tenant Tenant         @relation(fields: [tenantId], references: [id])
+  logs   EquipmentLog[]
+
+  @@unique([tenantId, code])
+}
+
+model EquipmentLog {
+  id          String   @id @default(cuid())
+  tenantId    String
+  projectId   String
+  equipmentId String
+  date        DateTime @default(now())
+  runningHours Float   @default(0)
+  idleHours   Float    @default(0)
+  fuelIssued  Float    @default(0)
+  operator    String?
+  taskId      String?
+  cost        Float    @default(0)
+  source      String   @default("WEB")
+
+  project   Project   @relation(fields: [projectId], references: [id])
+  equipment Equipment @relation(fields: [equipmentId], references: [id])
+
+  @@index([projectId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// QHSE · Inspections, NCRs, Incidents, Permits
+// ─────────────────────────────────────────────────────────────────────────
+
+model Inspection {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String
+  type       String // pre-concrete | waterproofing | electrical | material ...
+  title      String
+  checklist  String? // JSON text: [{item, ok}]
+  result     String   @default("Pass") // Pass | Fail
+  taskId     String?
+  inspectedBy String?
+  source     String   @default("WEB")
+  createdAt  DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id])
+
+  @@index([projectId])
+}
+
+model Ncr {
+  id           String   @id @default(cuid())
+  tenantId     String
+  projectId    String
+  number       String
+  title        String
+  description  String?
+  contractorId String?
+  reworkCost   Float    @default(0)
+  status       String   @default("Open") // Open | Assigned | Rectified | Verified | Closed
+  createdAt    DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id])
+
+  @@index([projectId, status])
+}
+
+model SafetyIncident {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String
+  type       String   @default("near-miss") // near-miss | first-aid | lost-time | fatal
+  title      String
+  description String?
+  severity   String   @default("low")
+  status     String   @default("Open")
+  createdAt  DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id])
+
+  @@index([projectId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// DOCUMENTS · Drawings & files
+// ─────────────────────────────────────────────────────────────────────────
+
+model Document {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String
+  folder     String   @default("General") // Drawings | Contracts | Correspondence | ...
+  name       String
+  revision   String   @default("R0")
+  status     String   @default("Good For Construction") // For Approval | Good For Construction | Superseded
+  url        String?
+  uploadedBy String?
+  createdAt  DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id])
+
+  @@index([projectId, folder])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CLIENT BILLING · Revenue side
+// ─────────────────────────────────────────────────────────────────────────
+
+model ClientRaBill {
+  id            String   @id @default(cuid())
+  tenantId      String
+  projectId     String
+  number        String
+  seq           Int      @default(1)
+  grossThisBill Float    @default(0)
+  cumulativeValue Float  @default(0)
+  retention     Float    @default(0)
+  advanceRecovery Float  @default(0)
+  gstAmount     Float    @default(0)
+  netClaim      Float    @default(0)
+  certifiedAmount Float  @default(0)
+  receivedAmount Float   @default(0)
+  status        String   @default("Submitted") // Draft | Submitted | Certified | Received
+  createdAt     DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id])
+
+  @@index([projectId])
+}
